@@ -1,9 +1,11 @@
-#ifndef ANDROID_HARDWARE_USB_V1_1_USB_H
-#define ANDROID_HARDWARE_USB_V1_1_USB_H
+#ifndef ANDROID_HARDWARE_USB_V1_3_USB_H
+#define ANDROID_HARDWARE_USB_V1_3_USB_H
 
-#include <android/hardware/usb/1.2/IUsb.h>
+#include <android-base/file.h>
+#include <android-base/properties.h>
 #include <android/hardware/usb/1.2/IUsbCallback.h>
 #include <android/hardware/usb/1.2/types.h>
+#include <android/hardware/usb/1.3/IUsb.h>
 #include <hidl/Status.h>
 #include <utils/Log.h>
 
@@ -17,10 +19,13 @@
 namespace android {
 namespace hardware {
 namespace usb {
-namespace V1_2 {
+namespace V1_3 {
 namespace implementation {
 
 using ::android::sp;
+using ::android::base::GetProperty;
+using ::android::base::SetProperty;
+using ::android::base::WriteStringToFile;
 using ::android::hardware::hidl_array;
 using ::android::hardware::hidl_memory;
 using ::android::hardware::hidl_string;
@@ -32,29 +37,25 @@ using ::android::hardware::usb::V1_0::PortPowerRole;
 using ::android::hardware::usb::V1_0::PortRole;
 using ::android::hardware::usb::V1_0::PortRoleType;
 using ::android::hardware::usb::V1_0::Status;
-using ::android::hardware::usb::V1_2::IUsb;
-using ::android::hardware::usb::V1_2::IUsbCallback;
-
 using ::android::hardware::usb::V1_1::PortMode_1_1;
 using ::android::hardware::usb::V1_1::PortStatus_1_1;
+using ::android::hardware::usb::V1_2::IUsbCallback;
 using ::android::hardware::usb::V1_2::PortStatus;
+using ::android::hardware::usb::V1_3::IUsb;
 using ::android::hidl::base::V1_0::DebugInfo;
 using ::android::hidl::base::V1_0::IBase;
 
-enum class HALVersion{
-    V1_0,
-    V1_1,
-    V1_2
-};
+enum class HALVersion { V1_0, V1_1, V1_2, V1_3 };
 
 struct Usb : public IUsb {
     Usb();
 
-    Return<void> switchRole(const hidl_string &portName, const V1_0::PortRole &role) override;
-    Return<void> setCallback(const sp<V1_0::IUsbCallback> &callback) override;
+    Return<void> switchRole(const hidl_string &portName, const PortRole &role) override;
+    Return<void> setCallback(const sp<V1_0::IUsbCallback>& callback) override;
     Return<void> queryPortStatus() override;
-    Return<void> enableContaminantPresenceDetection(const hidl_string& portName, bool enable);
-    Return<void> enableContaminantPresenceProtection(const hidl_string& portName, bool enable);
+    Return<void> enableContaminantPresenceDetection(const hidl_string &portName, bool enable);
+    Return<void> enableContaminantPresenceProtection(const hidl_string &portName, bool enable);
+    Return<bool> enableUsbDataSignal(bool enable) override;
 
     sp<V1_0::IUsbCallback> mCallback_1_0;
     // Protects mCallback variable
@@ -68,14 +69,14 @@ struct Usb : public IUsb {
     // Variable to signal partner coming back online after type switch
     bool mPartnerUp;
 
-  private:
-    pthread_t mPoll;
+    private:
+        pthread_t mPoll;
 };
 
 }  // namespace implementation
-}  // namespace V1_2
+}  // namespace V1_3
 }  // namespace usb
 }  // namespace hardware
 }  // namespace android
 
-#endif  // ANDROID_HARDWARE_USB_V1_2_USB_H
+#endif  // ANDROID_HARDWARE_USB_V1_3_USB_H

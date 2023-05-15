@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018 The Android Open Source Project
+ * Copyright (C) 2020 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,15 +14,17 @@
  * limitations under the License.
  */
 
-#pragma once
+#ifndef ANDROID_HARDWARE_USB_GADGET_V1_1_USBGADGET_H
+#define ANDROID_HARDWARE_USB_GADGET_V1_1_USBGADGET_H
 
+#include <UsbGadgetCommon.h>
 #include <android-base/file.h>
 #include <android-base/properties.h>
+#include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <android/hardware/usb/gadget/1.1/IUsbGadget.h>
 #include <hidl/MQDescriptor.h>
 #include <hidl/Status.h>
-#include <pixelusb/UsbGadgetCommon.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <utils/Log.h>
@@ -41,7 +43,9 @@ namespace implementation {
 
 using ::android::sp;
 using ::android::base::GetProperty;
+using ::android::base::ReadFileToString;
 using ::android::base::SetProperty;
+using ::android::base::Trim;
 using ::android::base::unique_fd;
 using ::android::base::WriteStringToFile;
 using ::android::hardware::hidl_array;
@@ -50,23 +54,17 @@ using ::android::hardware::hidl_string;
 using ::android::hardware::hidl_vec;
 using ::android::hardware::Return;
 using ::android::hardware::Void;
-using ::android::hardware::google::pixel::usb::addAdb;
-using ::android::hardware::google::pixel::usb::addEpollFd;
-using ::android::hardware::google::pixel::usb::getVendorFunctions;
-using ::android::hardware::google::pixel::usb::kDebug;
-using ::android::hardware::google::pixel::usb::kDisconnectWaitUs;
-using ::android::hardware::google::pixel::usb::linkFunction;
-using ::android::hardware::google::pixel::usb::MonitorFfs;
-using ::android::hardware::google::pixel::usb::resetGadget;
-using ::android::hardware::google::pixel::usb::setVidPid;
-using ::android::hardware::google::pixel::usb::unlinkFunctions;
-using ::android::hardware::usb::gadget::V1_0::GadgetFunction;
-using ::android::hardware::usb::gadget::V1_0::Status;
-using ::android::hardware::usb::gadget::V1_1::IUsbGadget;
+using ::android::hardware::usb::gadget::addAdb;
+using ::android::hardware::usb::gadget::addEpollFd;
+using ::android::hardware::usb::gadget::getVendorFunctions;
+using ::android::hardware::usb::gadget::kDebug;
+using ::android::hardware::usb::gadget::kDisconnectWaitUs;
+using ::android::hardware::usb::gadget::linkFunction;
+using ::android::hardware::usb::gadget::MonitorFfs;
+using ::android::hardware::usb::gadget::resetGadget;
+using ::android::hardware::usb::gadget::setVidPid;
+using ::android::hardware::usb::gadget::unlinkFunctions;
 using ::std::string;
-
-constexpr char kGadgetName[] = "a600000.dwc3";
-static MonitorFfs monitorFfs(kGadgetName);
 
 struct UsbGadget : public IUsbGadget {
     UsbGadget();
@@ -77,17 +75,17 @@ struct UsbGadget : public IUsbGadget {
     bool mCurrentUsbFunctionsApplied;
 
     Return<void> setCurrentUsbFunctions(uint64_t functions,
-                                        const sp<V1_0::IUsbGadgetCallback> &callback,
+                                        const sp<V1_0::IUsbGadgetCallback>& callback,
                                         uint64_t timeout) override;
 
-    Return<void> getCurrentUsbFunctions(const sp<V1_0::IUsbGadgetCallback> &callback) override;
+    Return<void> getCurrentUsbFunctions(const sp<V1_0::IUsbGadgetCallback>& callback) override;
 
     Return<Status> reset() override;
 
-private:
-    Status tearDownGadget();
-    Status setupFunctions(uint64_t functions, const sp<V1_0::IUsbGadgetCallback> &callback,
-                          uint64_t timeout);
+  private:
+    V1_0::Status tearDownGadget();
+    V1_0::Status setupFunctions(uint64_t functions, const sp<V1_0::IUsbGadgetCallback>& callback,
+                                uint64_t timeout);
 };
 
 }  // namespace implementation
@@ -96,3 +94,5 @@ private:
 }  // namespace usb
 }  // namespace hardware
 }  // namespace android
+
+#endif  // ANDROID_HARDWARE_USB_V1_1_USBGADGET_H

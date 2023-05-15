@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018 The Android Open Source Project
+ * Copyright (C) 2020 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#define LOG_TAG "android.hardware.usb.gadget@1.1-service.coral"
+#define LOG_TAG "android.hardware.usb@1.2-service-mediatekv2"
 
 #include "UsbGadget.h"
 #include <dirent.h>
@@ -33,186 +33,145 @@ namespace gadget {
 namespace V1_1 {
 namespace implementation {
 
+// For EngineerMode BypassService
+#define BYPASS (1 << 15)
+
+bool kByPassUsbd;
+bool kExitCheckThread;
+bool kUsbPullUp;
+std::condition_variable kCv;
+
+constexpr char kUsbController[] = "sys.usb.controller";
+
+#define UDC_PATH "/sys/class/udc/"
+#define SOFT_CONN "soft_connect"
+
+bool readFile(const std::string &filename, std::string *contents) {
+  FILE *fp;
+  ssize_t read = 0;
+  char *line = NULL;
+  size_t len = 0;
+
+  fp = fopen(filename.c_str(), "r");
+  if (fp != NULL) {
+    if ((read = getline(&line, &len, fp)) != -1) {
+      char *pos;
+      if ((pos = strchr(line, '\n')) != NULL) *pos = '\0';
+      *contents = line;
+    }
+    free(line);
+    fclose(fp);
+  } else {
+    ALOGE("fopen failed");
+    return false;
+  }
+
+  return true;
+}
+
+void waitForUsbPullDown() {
+    string udc = "udc";
+
+    while (!kExitCheckThread) {
+        if (readFile(PULLUP_PATH, &udc) && (udc == "" || udc == "none")) {
+            kUsbPullUp = false;
+            break;
+        }
+        usleep(100);
+    }
+
+    kCv.notify_all();
+}
+
+void waitForUsbPullUp() {
+    string udc = "none";
+
+    while (!kExitCheckThread) {
+        if (readFile(PULLUP_PATH, &udc) && udc != "" && udc != "none") {
+            kUsbPullUp = true;
+            break;
+        }
+        usleep(100);
+    }
+
+    kCv.notify_all();
+}
+
+static string getUdcPath(const char *subPath) {
+    string gadgetName = GetProperty(kUsbController, "");
+    string ret = "";
+
+    if (!subPath) {
+        ALOGI("subPath is null");
+        return ret;
+    }
+
+    if (gadgetName.empty()) {
+        ALOGI("can't get controller name");
+        return ret;
+    }
+
+    ret = UDC_PATH + gadgetName + "/" + subPath;
+
+    return ret;
+}
+
 UsbGadget::UsbGadget() {
     if (access(OS_DESC_PATH, R_OK) != 0) {
         ALOGE("configfs setup not done yet");
         abort();
     }
+
+    ALOGI("UsbGadget");
+    kByPassUsbd = true;
 }
 
-void currentFunctionsAppliedCallback(bool functionsApplied, void *payload) {
-    UsbGadget *gadget = (UsbGadget *)payload;
+void currentFunctionsAppliedCallback(bool functionsApplied, void* payload) {
+    UsbGadget* gadget = (UsbGadget*)payload;
     gadget->mCurrentUsbFunctionsApplied = functionsApplied;
 }
 
-Return<void> UsbGadget::getCurrentUsbFunctions(const sp<V1_0::IUsbGadgetCallback> &callback) {
+Return<void> UsbGadget::getCurrentUsbFunctions(const sp<V1_0::IUsbGadgetCallback>& callback) {
     Return<void> ret = callback->getCurrentUsbFunctionsCb(
-        mCurrentUsbFunctions,
-        mCurrentUsbFunctionsApplied ? Status::FUNCTIONS_APPLIED : Status::FUNCTIONS_NOT_APPLIED);
-    if (!ret.isOk())
-        ALOGE("Call to getCurrentUsbFunctionsCb failed %s", ret.description().c_str());
+            mCurrentUsbFunctions, mCurrentUsbFunctionsApplied ? Status::FUNCTIONS_APPLIED
+                                                              : Status::FUNCTIONS_NOT_APPLIED);
+    if (!ret.isOk()) ALOGE("Call to getCurrentUsbFunctionsCb failed %s", ret.description().c_str());
 
     return Void();
 }
 
 V1_0::Status UsbGadget::tearDownGadget() {
-    if (resetGadget() != Status::SUCCESS)
-        return Status::ERROR;
+    std::unique_lock<std::mutex> lk(mLockSetCurrentFunction);
+    V1_0::Status ret = V1_0::Status::SUCCESS;
+    int timeout = 500; //500 ms
+    string soft_connect = getUdcPath(SOFT_CONN);
 
-    if (monitorFfs.isMonitorRunning()) {
-        monitorFfs.reset();
+    ALOGI("tearDownGadget");
+
+    if (soft_connect != "") {
+        if (!WriteStringToFile("disconnect", soft_connect)) {
+            ALOGI("Gadget cannot be disconnected");
+        } else {
+           // wait userspace process close
+	   std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+    }
+
+    if (!SetProperty("vendor.usb.config", "none"))
+        return V1_0::Status::ERROR;
+
+    kExitCheckThread = false;
+    std::thread checkThread(waitForUsbPullDown);
+
+    // Monitors the paths to pull down the gadget
+    if (kCv.wait_for(lk, timeout * 1ms, [] { return !kUsbPullUp; })) {
     } else {
-        ALOGI("mMonitor not running");
+        ALOGE("waitForUsbPullDown timeout");
+        ret = V1_0::Status::ERROR;
     }
-    return Status::SUCCESS;
-}
 
-static V1_0::Status validateAndSetVidPid(uint64_t functions) {
-    V1_0::Status ret = Status::SUCCESS;
-    std::string vendorFunctions = getVendorFunctions();
-
-    switch (functions) {
-        case static_cast<uint64_t>(GadgetFunction::MTP):
-            if (vendorFunctions == "diag") {
-                ret = setVidPid("0x05C6", "0x901B");
-            } else {
-                if (!(vendorFunctions == "user" || vendorFunctions == "")) {
-                    ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-                    ret = Status::CONFIGURATION_NOT_SUPPORTED;
-                } else {
-                    ret = setVidPid("0x18d1", "0x4ee1");
-                }
-            }
-            break;
-        case GadgetFunction::ADB | GadgetFunction::MTP:
-            if (vendorFunctions == "diag") {
-                ret = setVidPid("0x05C6", "0x903A");
-            } else {
-                if (!(vendorFunctions == "user" || vendorFunctions == "")) {
-                    ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-                    ret = Status::CONFIGURATION_NOT_SUPPORTED;
-                } else {
-                    ret = setVidPid("0x18d1", "0x4ee2");
-                }
-            }
-            break;
-        case static_cast<uint64_t>(GadgetFunction::RNDIS):
-            if (vendorFunctions == "diag") {
-                ret = setVidPid("0x05C6", "0x902C");
-            } else if (vendorFunctions == "serial_cdev,diag") {
-                ret = setVidPid("0x05C6", "0x90B5");
-            } else if (vendorFunctions == "diag,diag_mdm,qdss,qdss_mdm,serial_cdev,dpl_gsi") {
-                ret = setVidPid("0x05C6", "0x90E6");
-            } else {
-                if (!(vendorFunctions == "user" || vendorFunctions == "")) {
-                    ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-                    ret = Status::CONFIGURATION_NOT_SUPPORTED;
-                } else {
-                    ret = setVidPid("0x18d1", "0x4ee3");
-                }
-            }
-            break;
-        case GadgetFunction::ADB | GadgetFunction::RNDIS:
-            if (vendorFunctions == "diag") {
-                ret = setVidPid("0x05C6", "0x902D");
-            } else if (vendorFunctions == "serial_cdev,diag") {
-                ret = setVidPid("0x05C6", "0x90B6");
-            } else if (vendorFunctions == "diag,diag_mdm,qdss,qdss_mdm,serial_cdev,dpl_gsi") {
-                ret = setVidPid("0x05C6", "0x90E7");
-            } else {
-                if (!(vendorFunctions == "user" || vendorFunctions == "")) {
-                    ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-                    ret = Status::CONFIGURATION_NOT_SUPPORTED;
-                } else {
-                    ret = setVidPid("0x18d1", "0x4ee4");
-                }
-            }
-            break;
-        case static_cast<uint64_t>(GadgetFunction::PTP):
-            if (!(vendorFunctions == "user" || vendorFunctions == "")) {
-                ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-                ret = Status::CONFIGURATION_NOT_SUPPORTED;
-            } else {
-                ret = setVidPid("0x18d1", "0x4ee5");
-            }
-            break;
-        case GadgetFunction::ADB | GadgetFunction::PTP:
-            if (!(vendorFunctions == "user" || vendorFunctions == "")) {
-                ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-                ret = Status::CONFIGURATION_NOT_SUPPORTED;
-            } else {
-                ret = setVidPid("0x18d1", "0x4ee6");
-            }
-            break;
-        case static_cast<uint64_t>(GadgetFunction::ADB):
-            if (vendorFunctions == "diag") {
-                ret = setVidPid("0x05C6", "0x901D");
-            } else if (vendorFunctions == "diag,serial_cdev,rmnet_gsi") {
-                ret = setVidPid("0x05C6", "0x9091");
-            } else if (vendorFunctions == "diag,serial_cdev") {
-                ret = setVidPid("0x05C6", "0x901F");
-            } else if (vendorFunctions ==
-                       "diag,diag_mdm,qdss,qdss_mdm,serial_cdev,dpl_gsi,rmnet_gsi") {
-                ret = setVidPid("0x05C6", "0x90E5");
-            } else {
-                if (!(vendorFunctions == "user" || vendorFunctions == "")) {
-                    ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-                    ret = Status::CONFIGURATION_NOT_SUPPORTED;
-                } else {
-                    ret = setVidPid("0x18d1", "0x4ee7");
-                }
-            }
-            break;
-        case static_cast<uint64_t>(GadgetFunction::MIDI):
-            if (!(vendorFunctions == "user" || vendorFunctions == "")) {
-                ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-                ret = Status::CONFIGURATION_NOT_SUPPORTED;
-            } else {
-                ret = setVidPid("0x18d1", "0x4ee8");
-            }
-            break;
-        case GadgetFunction::ADB | GadgetFunction::MIDI:
-            if (!(vendorFunctions == "user" || vendorFunctions == "")) {
-                ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-                ret = Status::CONFIGURATION_NOT_SUPPORTED;
-            } else {
-                ret = setVidPid("0x18d1", "0x4ee9");
-            }
-            break;
-        case static_cast<uint64_t>(GadgetFunction::ACCESSORY):
-            if (!(vendorFunctions == "user" || vendorFunctions == ""))
-                ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-            ret = setVidPid("0x18d1", "0x2d00");
-            break;
-        case GadgetFunction::ADB | GadgetFunction::ACCESSORY:
-            if (!(vendorFunctions == "user" || vendorFunctions == ""))
-                ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-            ret = setVidPid("0x18d1", "0x2d01");
-            break;
-        case static_cast<uint64_t>(GadgetFunction::AUDIO_SOURCE):
-            if (!(vendorFunctions == "user" || vendorFunctions == ""))
-                ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-            ret = setVidPid("0x18d1", "0x2d02");
-            break;
-        case GadgetFunction::ADB | GadgetFunction::AUDIO_SOURCE:
-            if (!(vendorFunctions == "user" || vendorFunctions == ""))
-                ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-            ret = setVidPid("0x18d1", "0x2d03");
-            break;
-        case GadgetFunction::ACCESSORY | GadgetFunction::AUDIO_SOURCE:
-            if (!(vendorFunctions == "user" || vendorFunctions == ""))
-                ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-            ret = setVidPid("0x18d1", "0x2d04");
-            break;
-        case GadgetFunction::ADB | GadgetFunction::ACCESSORY | GadgetFunction::AUDIO_SOURCE:
-            if (!(vendorFunctions == "user" || vendorFunctions == ""))
-                ALOGE("Invalid vendorFunctions set: %s", vendorFunctions.c_str());
-            ret = setVidPid("0x18d1", "0x2d05");
-            break;
-        default:
-            ALOGE("Combination not supported");
-            ret = Status::CONFIGURATION_NOT_SUPPORTED;
-    }
+    kExitCheckThread = true;
+    checkThread.join();
     return ret;
 }
 
@@ -222,89 +181,212 @@ Return<Status> UsbGadget::reset() {
         return Status::ERROR;
     }
 
+    usleep(kDisconnectWaitUs);
+
+    string gadgetName = GetProperty(kUsbController, "");
+
+    if (gadgetName.empty()) {
+        ALOGI("can't get controller name");
+        return Status::ERROR;
+    }
+
+    ALOGI("pulled up %s", gadgetName.c_str());
+
+    if (!WriteStringToFile(gadgetName, PULLUP_PATH)) {
+        ALOGI("Gadget cannot be pulled up");
+        return Status::ERROR;
+    }
+
     return Status::SUCCESS;
 }
 
-V1_0::Status UsbGadget::setupFunctions(uint64_t functions,
-                                       const sp<V1_0::IUsbGadgetCallback> &callback,
-                                       uint64_t timeout) {
-    bool ffsEnabled = false;
-    int i = 0;
+static V1_0::Status switchUsbFunctions(uint64_t functions) {
+    V1_0::Status ret = V1_0::Status::SUCCESS;
+    string f_str = "";
 
-    if (addGenericAndroidFunctions(&monitorFfs, functions, &ffsEnabled, &i) != Status::SUCCESS)
-        return Status::ERROR;
+    switch (functions) {
+        case static_cast<uint64_t>(V1_0::GadgetFunction::MTP):
+            f_str = "mtp";
+            break;
+        case V1_0::GadgetFunction::ADB | V1_0::GadgetFunction::MTP:
+            f_str = "mtp,adb";
+            break;
+        case static_cast<uint64_t>(V1_0::GadgetFunction::RNDIS):
+            f_str = "rndis";
+            break;
+        case V1_0::GadgetFunction::ADB | V1_0::GadgetFunction::RNDIS:
+            f_str = "rndis,adb";
+            break;
+        case static_cast<uint64_t>(V1_0::GadgetFunction::PTP):
+            f_str = "ptp";
+            break;
+        case V1_0::GadgetFunction::ADB | V1_0::GadgetFunction::PTP:
+            f_str = "ptp,adb";
+            break;
+        case static_cast<uint64_t>(V1_0::GadgetFunction::ADB):
+            f_str = "adb";
+            break;
+        case static_cast<uint64_t>(V1_0::GadgetFunction::MIDI):
+            f_str = "midi";
+            break;
+        case V1_0::GadgetFunction::ADB | V1_0::GadgetFunction::MIDI:
+            f_str = "midi,adb";
+            break;
+        case static_cast<uint64_t>(V1_0::GadgetFunction::ACCESSORY):
+            f_str = "accessory";
+            break;
+        case V1_0::GadgetFunction::ADB | V1_0::GadgetFunction::ACCESSORY:
+            f_str = "accessory,adb";
+            break;
+        case static_cast<uint64_t>(V1_0::GadgetFunction::AUDIO_SOURCE):
+            f_str = "audio_source";
+            break;
+        case V1_0::GadgetFunction::ADB | V1_0::GadgetFunction::AUDIO_SOURCE:
+            f_str = "audio_source,adb";
+            break;
+        case V1_0::GadgetFunction::ACCESSORY | V1_0::GadgetFunction::AUDIO_SOURCE:
+            f_str = "accessory,audio_source";
+            break;
+        case V1_0::GadgetFunction::ADB | V1_0::GadgetFunction::ACCESSORY |
+                V1_0::GadgetFunction::AUDIO_SOURCE:
+            f_str = "accessory,audio_source,adb";
+            break;
+        case BYPASS:
+            f_str = "via_bypass";
+            break;
+        case V1_0::GadgetFunction::ADB | BYPASS:
+            f_str = "via_bypass,adb";
+            break;
+        default:
+            ALOGE("Combination not supported");
+            return V1_0::Status::CONFIGURATION_NOT_SUPPORTED;
+    }
 
-    std::string vendorFunctions = getVendorFunctions();
+    ALOGI("switchUsbFunctions %s", f_str.c_str());
 
-    if (vendorFunctions != "") {
-        ALOGI("enable usbradio debug functions");
-        char *function = strtok(const_cast<char *>(vendorFunctions.c_str()), ",");
-        while (function != NULL) {
-            if (string(function) == "diag" && linkFunction("diag.diag", i++))
-                return Status::ERROR;
-            if (string(function) == "diag_mdm" && linkFunction("diag.diag_mdm", i++))
-                return Status::ERROR;
-            if (string(function) == "qdss" && linkFunction("qdss.qdss", i++))
-                return Status::ERROR;
-            if (string(function) == "qdss_mdm" && linkFunction("qdss.qdss_mdm", i++))
-                return Status::ERROR;
-            if (string(function) == "serial_cdev" && linkFunction("cser.dun.0", i++))
-                return Status::ERROR;
-            if (string(function) == "dpl_gsi" && linkFunction("gsi.dpl", i++))
-                return Status::ERROR;
-            if (string(function) == "rmnet_gsi" && linkFunction("gsi.rmnet", i++))
-                return Status::ERROR;
-            function = strtok(NULL, ",");
+    if (!SetProperty("vendor.usb.config", f_str))
+        ret = V1_0::Status::ERROR;
+
+    return ret;
+}
+
+bool isMTPReady(uint64_t functions) {
+    bool mtpReady = true;
+
+    if (((functions & GadgetFunction::MTP) != 0)) {
+        if (access("/dev/usb-ffs/mtp/ep1", R_OK)) {
+            ALOGI("%s absent", "/dev/usb-ffs/mtp/ep1");
+            mtpReady = false;
+        }
+
+        if (access("/dev/usb-ffs/mtp/ep2", R_OK)) {
+            ALOGI("%s absent", "/dev/usb-ffs/mtp/ep2");
+            mtpReady = false;
+        }
+
+        if (access("/dev/usb-ffs/mtp/ep3", R_OK)) {
+            ALOGI("%s absent", "/dev/usb-ffs/mtp/ep3");
+            mtpReady = false;
+        }
+    } else if (((functions & GadgetFunction::PTP) != 0)) {
+        if (access("/dev/usb-ffs/ptp/ep1", R_OK)) {
+            ALOGI("%s absent", "/dev/usb-ffs/ptp/ep1");
+            mtpReady = false;
+        }
+
+        if (access("/dev/usb-ffs/ptp/ep2", R_OK)) {
+            ALOGI("%s absent", "/dev/usb-ffs/ptp/ep2");
+            mtpReady = false;
+        }
+
+        if (access("/dev/usb-ffs/ptp/ep3", R_OK)) {
+            ALOGI("%s absent", "/dev/usb-ffs/ptp/ep3");
+            mtpReady = false;
+        }
+    }
+    return mtpReady;
+}
+
+void checkMTP(uint64_t functions) {
+    bool mtpReady = true;
+
+    mtpReady = isMTPReady(functions);
+    ALOGI("checkMTP(%d)", mtpReady);
+
+    // wait and retry
+    if (mtpReady == false) {
+        for (int i = 0; i < 20; i++) {
+            mtpReady = isMTPReady(functions);
+            ALOGI("checkMTP(%d, %d)", i, mtpReady);
+
+            if (mtpReady == true)
+                break;
+
+            usleep(50*1000); // 50 ms
         }
     }
 
-    if ((functions & GadgetFunction::ADB) != 0) {
-        ffsEnabled = true;
-        if (addAdb(&monitorFfs, &i) != Status::SUCCESS)
-            return Status::ERROR;
+    if (((functions & GadgetFunction::MTP) != 0)) {
+        if (mtpReady == true)
+            SetProperty("vendor.usb.ffs.mtp.ready", "1");
+        else
+            SetProperty("vendor.usb.ffs.mtp.ready", "0");
+    } else if (((functions & GadgetFunction::PTP) != 0)) {
+        if (mtpReady == true)
+            SetProperty("vendor.usb.ffs.ptp.ready", "1");
+        else
+            SetProperty("vendor.usb.ffs.ptp.ready", "0");
     }
+}
 
-    // Pull up the gadget right away when there are no ffs functions.
-    if (!ffsEnabled) {
-        if (!WriteStringToFile(kGadgetName, PULLUP_PATH))
-            return Status::ERROR;
+V1_0::Status UsbGadget::setupFunctions(uint64_t functions,
+                                       const sp<V1_0::IUsbGadgetCallback>& callback,
+                                       uint64_t timeout) {
+    std::unique_lock<std::mutex> lk(mLockSetCurrentFunction);
+    V1_0::Status ret = V1_0::Status::SUCCESS;
+
+    checkMTP(functions);
+
+    ret = switchUsbFunctions(functions);
+    if (ret != V1_0::Status::SUCCESS)
+        return ret;
+
+    kExitCheckThread = false;
+    std::thread checkThread(waitForUsbPullUp);
+
+    // Monitors the paths to pull up the gadget
+    if (kCv.wait_for(lk, timeout * 1ms, [] { return kUsbPullUp; })) {
         mCurrentUsbFunctionsApplied = true;
-        if (callback)
-            callback->setCurrentUsbFunctionsCb(functions, Status::SUCCESS);
-        return Status::SUCCESS;
+        if (callback) callback->setCurrentUsbFunctionsCb(functions, V1_0::Status::SUCCESS);
+    } else {
+        ALOGE("waitForUsbPullUp timeout");
+        ret = V1_0::Status::ERROR;
     }
 
-    monitorFfs.registerFunctionsAppliedCallback(&currentFunctionsAppliedCallback, this);
-    // Monitors the ffs paths to pull up the gadget when descriptors are written.
-    // Also takes of the pulling up the gadget again if the userspace process
-    // dies and restarts.
-    monitorFfs.startMonitor();
-
-    if (kDebug)
-        ALOGI("Mainthread in Cv");
-
-    if (callback) {
-        bool pullup = monitorFfs.waitForPullUp(timeout);
-        Return<void> ret = callback->setCurrentUsbFunctionsCb(
-            functions, pullup ? Status::SUCCESS : Status::ERROR);
-        if (!ret.isOk())
-            ALOGE("setCurrentUsbFunctionsCb error %s", ret.description().c_str());
-    }
-
-    return Status::SUCCESS;
+    kExitCheckThread = true;
+    checkThread.join();
+    return ret;
 }
 
 Return<void> UsbGadget::setCurrentUsbFunctions(uint64_t functions,
-                                               const sp<V1_0::IUsbGadgetCallback> &callback,
+                                               const sp<V1_0::IUsbGadgetCallback>& callback,
                                                uint64_t timeout) {
-    std::unique_lock<std::mutex> lk(mLockSetCurrentFunction);
+    V1_0::Status status = V1_0::Status::ERROR;
 
     mCurrentUsbFunctions = functions;
     mCurrentUsbFunctionsApplied = false;
+    kUsbPullUp = true;
+
+    if (kByPassUsbd) {
+        ALOGI("setCurrentUsbFunctions: skip first time for usbd\n");
+        kByPassUsbd = false;
+        mCurrentUsbFunctionsApplied = true;
+        goto error;
+    }
 
     // Unlink the gadget and stop the monitor if running.
-    V1_0::Status status = tearDownGadget();
-    if (status != Status::SUCCESS) {
+    status = tearDownGadget();
+    if (status != V1_0::Status::SUCCESS) {
         goto error;
     }
 
@@ -313,23 +395,16 @@ Return<void> UsbGadget::setCurrentUsbFunctions(uint64_t functions,
     // Leave the gadget pulled down to give time for the host to sense disconnect.
     usleep(kDisconnectWaitUs);
 
-    if (functions == static_cast<uint64_t>(GadgetFunction::NONE)) {
-        if (callback == NULL)
-            return Void();
-        Return<void> ret = callback->setCurrentUsbFunctionsCb(functions, Status::SUCCESS);
+    if (functions == static_cast<uint64_t>(V1_0::GadgetFunction::NONE)) {
+        if (callback == NULL) return Void();
+        Return<void> ret = callback->setCurrentUsbFunctionsCb(functions, V1_0::Status::SUCCESS);
         if (!ret.isOk())
             ALOGE("Error while calling setCurrentUsbFunctionsCb %s", ret.description().c_str());
         return Void();
     }
 
-    status = validateAndSetVidPid(functions);
-
-    if (status != Status::SUCCESS) {
-        goto error;
-    }
-
     status = setupFunctions(functions, callback, timeout);
-    if (status != Status::SUCCESS) {
+    if (status != V1_0::Status::SUCCESS) {
         goto error;
     }
 
@@ -338,8 +413,7 @@ Return<void> UsbGadget::setCurrentUsbFunctions(uint64_t functions,
 
 error:
     ALOGI("Usb Gadget setcurrent functions failed");
-    if (callback == NULL)
-        return Void();
+    if (callback == NULL) return Void();
     Return<void> ret = callback->setCurrentUsbFunctionsCb(functions, status);
     if (!ret.isOk())
         ALOGE("Error while calling setCurrentUsbFunctionsCb %s", ret.description().c_str());
